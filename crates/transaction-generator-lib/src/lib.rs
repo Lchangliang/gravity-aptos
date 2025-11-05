@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use aptos_infallible::{RwLock, RwLockWriteGuard};
-use aptos_logger::{info, sample, sample::SampleRate, warn};
+use aptos_logger::{sample, sample::SampleRate};
 use aptos_sdk::{
     move_types::account_address::AccountAddress,
     transaction_builder::{aptos_stdlib, TransactionFactory},
@@ -13,6 +13,7 @@ use aptos_sdk::{
 };
 use async_trait::async_trait;
 use clap::{Parser, ValueEnum};
+use log::{info, warn};
 use publishing::{
     entry_point_trait::{EntryPointTrait, PreBuiltPackages},
     publish_util::PackageHandler,
@@ -53,7 +54,10 @@ use crate::{
     entry_points::EntryPointTransactionGenerator, p2p_transaction_generator::SamplingMode,
     workflow_delegator::WorkflowTxnGeneratorCreator,
 };
-pub use publishing::{entry_point_trait, prebuild_packages::create_prebuilt_packages_rs_file};
+pub use publishing::{
+    entry_point_trait,
+    prebuild_packages::{create_prebuilt_packages_bundle, PrebuiltPackageConfig},
+};
 
 pub const SEND_AMOUNT: u64 = 1;
 
@@ -91,7 +95,6 @@ pub enum TransactionType {
     Workflow {
         workflow_kind: Box<dyn WorkflowKind>,
         num_modules: usize,
-        use_account_pool: bool,
         progress_type: WorkflowProgress,
     },
 }
@@ -123,7 +126,7 @@ impl Default for TransactionType {
             invalid_transaction_ratio: 0,
             sender_use_account_pool: false,
             non_conflicting: false,
-            use_fa_transfer: false,
+            use_fa_transfer: true,
         }
     }
 }
@@ -393,7 +396,6 @@ pub async fn create_txn_generator_creator(
                 },
                 TransactionType::Workflow {
                     num_modules,
-                    use_account_pool,
                     workflow_kind,
                     progress_type,
                 } => Box::new(
@@ -404,7 +406,6 @@ pub async fn create_txn_generator_creator(
                         &root_account,
                         txn_executor,
                         num_modules,
-                        use_account_pool.then(|| accounts_pool.clone()),
                         cur_phase.clone(),
                         progress_type,
                     )

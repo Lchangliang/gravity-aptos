@@ -13,8 +13,10 @@ use move_core_types::{
 };
 use move_ir_compiler::Compiler;
 use move_vm_runtime::{
-    module_traversal::*, move_vm::MoveVM, native_extensions::NativeContextExtensions,
-    native_functions::NativeFunction, AsUnsyncCodeStorage, RuntimeEnvironment,
+    data_cache::TransactionDataCache, dispatch_loader, module_traversal::*, move_vm::MoveVM,
+    native_extensions::NativeContextExtensions, native_functions::NativeFunction,
+    AsUnsyncCodeStorage, InstantiatedFunctionLoader, LegacyLoaderConfig, RuntimeEnvironment,
+    ScriptLoader,
 };
 use move_vm_test_utils::InMemoryStorage;
 use move_vm_types::{
@@ -33,7 +35,7 @@ enum Entrypoint {
 fn make_native_create_signer() -> NativeFunction {
     Arc::new(|_context, ty_args: Vec<Type>, mut args: VecDeque<Value>| {
         assert!(ty_args.is_empty());
-        assert!(args.len() == 1);
+        assert_eq!(args.len(), 1);
 
         let address = pop_arg!(args, AccountAddress);
 
@@ -161,7 +163,6 @@ fn main() -> Result<()> {
 
     let runtime_environment = RuntimeEnvironment::new(natives);
     let mut storage = InMemoryStorage::new_with_runtime_environment(runtime_environment);
-    let vm = MoveVM::new();
 
     let test_modules = compile_test_modules();
     for module in &test_modules {
@@ -185,36 +186,48 @@ fn main() -> Result<()> {
 
     let mut extensions = NativeContextExtensions::default();
     extensions.add(NativeTableContext::new([0; 32], &storage));
-    let mut sess = vm.new_session_with_extensions(&storage, extensions);
 
+    let mut gas_meter = UnmeteredGasMeter;
     let traversal_storage = TraversalStorage::new();
+    let mut traversal_context = TraversalContext::new(&traversal_storage);
+
     let code_storage = storage.as_unsync_code_storage();
 
-    let args: Vec<Vec<u8>> = vec![];
-    match entrypoint {
-        Entrypoint::Script(script_blob) => {
-            sess.execute_script(
+    let return_values = dispatch_loader!(&code_storage, loader, {
+        // There was no charging for loading scripts or functions here prior to lazy loading.
+        let legacy_loader_config = LegacyLoaderConfig::unmetered();
+
+        let func = match &entrypoint {
+            Entrypoint::Script(script_blob) => loader.load_script(
+                &legacy_loader_config,
+                &mut gas_meter,
+                &mut traversal_context,
                 script_blob,
-                vec![],
-                args,
-                &mut UnmeteredGasMeter,
-                &mut TraversalContext::new(&traversal_storage),
-                &code_storage,
-            )?;
-        },
-        Entrypoint::Module(module_id) => {
-            let res = sess.execute_function_bypass_visibility(
-                &module_id,
+                &[],
+            )?,
+            Entrypoint::Module(module_id) => loader.load_instantiated_function(
+                &legacy_loader_config,
+                &mut gas_meter,
+                &mut traversal_context,
+                module_id,
                 ident_str!("run"),
-                vec![],
-                args,
-                &mut UnmeteredGasMeter,
-                &mut TraversalContext::new(&traversal_storage),
-                &code_storage,
-            )?;
-            println!("{:?}", res);
-        },
-    }
+                &[],
+            )?,
+        };
+
+        MoveVM::execute_loaded_function(
+            func,
+            // No arguments.
+            Vec::<Vec<u8>>::new(),
+            &mut TransactionDataCache::empty(),
+            &mut gas_meter,
+            &mut traversal_context,
+            &mut extensions,
+            &loader,
+            &storage,
+        )
+    })?;
+    println!("{:?}", return_values);
 
     Ok(())
 }

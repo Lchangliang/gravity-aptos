@@ -156,7 +156,7 @@ pub fn native_coin() -> Currency {
         symbol: APT_SYMBOL.to_string(),
         decimals: APT_DECIMALS,
         metadata: Some(CurrencyMetadata {
-            move_type: Some(native_coin_tag().to_string()),
+            move_type: Some(native_coin_tag().to_canonical_string()),
             fa_address: None,
         }),
     }
@@ -213,7 +213,7 @@ pub fn find_coin_currency(currencies: &HashSet<Currency>, type_tag: &TypeTag) ->
                 fa_address: _,
             }) = currency.metadata
             {
-                move_type == &type_tag.to_string()
+                move_type == &type_tag.to_canonical_string()
             } else {
                 false
             }
@@ -394,7 +394,7 @@ pub fn parse_coin_currency(
             .as_ref()
             .and_then(|inner| inner.move_type.as_ref())
         {
-            struct_tag.to_string() == *move_type
+            struct_tag.to_canonical_string() == *move_type
         } else {
             false
         }
@@ -403,7 +403,7 @@ pub fn parse_coin_currency(
     } else {
         Err(ApiError::TransactionParseError(Some(format!(
             "Invalid coin for transfer {}",
-            struct_tag
+            struct_tag.to_canonical_string()
         ))))
     }
 }
@@ -421,7 +421,7 @@ mod test {
             .block_height(ChainId::test())
             .expect("Matching chain id should work");
         block_hash
-            .block_height(ChainId::new(NamedChain::MAINNET.id().try_into().unwrap()))
+            .block_height(ChainId::new(NamedChain::MAINNET.id()))
             .expect_err("Mismatch chain id should not work");
     }
 
@@ -436,8 +436,8 @@ mod test {
     #[test]
     pub fn valid_block_hashes() {
         let valid_block_hashes: Vec<(&str, ChainId, u64)> = vec![
-            ("testnet-0", ChainId::new(NamedChain::TESTNET.id().try_into().unwrap()), 0),
-            ("mainnet-20", ChainId::new(NamedChain::MAINNET.id().try_into().unwrap()), 20),
+            ("testnet-0", ChainId::new(NamedChain::TESTNET.id()), 0),
+            ("mainnet-20", ChainId::new(NamedChain::MAINNET.id()), 20),
             ("5-2", ChainId::new(5), 2),
         ];
         for (str, chain_id, height) in valid_block_hashes {

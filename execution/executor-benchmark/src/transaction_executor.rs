@@ -7,6 +7,7 @@ use aptos_crypto::hash::HashValue;
 use aptos_executor::block_executor::BlockExecutor;
 use aptos_executor_types::BlockExecutorTrait;
 use aptos_logger::info;
+use aptos_metrics_core::TimerHelper;
 use aptos_types::block_executor::{
     config::BlockExecutorConfigFromOnchain, partitioner::ExecutableBlock,
 };
@@ -50,6 +51,7 @@ where
         current_block_start_time: Instant,
         partition_time: Duration,
         executable_block: ExecutableBlock,
+        stage: usize,
     ) {
         let execution_start_time = Instant::now();
         if self.maybe_first_block_start_time.is_none() {
@@ -62,7 +64,7 @@ where
         );
         let num_input_txns = executable_block.transactions.num_transactions();
         {
-            let _timer = TIMER.with_label_values(&["execute"]).start_timer();
+            let _timer = TIMER.timer_with(&["execute"]);
             self.executor
                 .execute_and_update_state(
                     executable_block,
@@ -79,6 +81,7 @@ where
             block_id,
             parent_block_id: self.parent_block_id,
             num_input_txns,
+            stage,
         };
         self.ledger_update_sender.send(msg).unwrap();
         self.parent_block_id = block_id;

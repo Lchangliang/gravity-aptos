@@ -2,6 +2,7 @@
 // Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(unexpected_cfgs)]
 #![forbid(unsafe_code)]
 
 mod consensus;
@@ -368,6 +369,12 @@ pub fn start_test_environment_node(
         println!(
             "\tIndexer gRPC node stream endpoint: {}",
             config.indexer_grpc.address
+        );
+    }
+    if config.admin_service.enabled.unwrap_or(false) {
+        println!(
+            "\tAdmin service: http://{}:{}/",
+            config.admin_service.address, config.admin_service.port
         );
     }
     if enable_lazy_mode {

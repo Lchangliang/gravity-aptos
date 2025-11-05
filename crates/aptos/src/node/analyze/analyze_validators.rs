@@ -311,7 +311,7 @@ impl AnalyzeValidators {
     pub fn fetch_epoch(epoch: u64, aptos_db: &dyn DbReader) -> Result<Vec<VersionedNewBlockEvent>> {
         let batch = 100;
 
-        let mut cursor = u64::max_value();
+        let mut cursor = u64::MAX;
         let mut result: Vec<VersionedNewBlockEvent> = vec![];
         let ledger_version = aptos_db.get_latest_ledger_info()?.ledger_info().version();
 
@@ -526,7 +526,7 @@ impl AnalyzeValidators {
             previous_round
         );
 
-        return EpochStats {
+        EpochStats {
             validator_stats: validators
                 .iter()
                 .map(|validator| {
@@ -552,7 +552,78 @@ impl AnalyzeValidators {
                 .into_iter()
                 .map(|(num_blocks_for_max_tps, _, max_tps)| (num_blocks_for_max_tps, max_tps))
                 .collect(),
-        };
+        }
+    }
+
+    pub fn analyze_gap<'a, I>(blocks: I) -> MaxGapInfo
+    where
+        I: Iterator<Item = &'a VersionedNewBlockEvent>,
+    {
+        let mut non_epoch_round_gap = GapSummary::empty();
+        let mut epoch_round_gap = GapSummary::empty();
+
+        let mut non_epoch_time_gap = GapSummary::empty();
+        let mut epoch_time_gap = GapSummary::empty();
+
+        let mut prev_non_nil_block = None;
+        let mut prev_non_nil_ts = 0;
+        let mut failed_from_nil = 0;
+        let mut epoch_from_nil = false;
+        let mut previous_epooch = 0;
+        let mut previous_round = 0;
+        for block in blocks {
+            let is_nil = block.event.proposer() == AccountAddress::ZERO;
+
+            let (current_gap, current_epoch_change) = if previous_epooch == block.event.epoch() {
+                (block.event.round() - previous_round - 1, false)
+            } else {
+                (block.event.failed_proposer_indices().len() as u64, true)
+            };
+
+            if is_nil {
+                failed_from_nil += current_gap;
+                epoch_from_nil |= current_epoch_change;
+            } else {
+                if prev_non_nil_ts > 0 {
+                    let round_gap = current_gap + failed_from_nil;
+                    let time_gap = block.event.proposed_time() as i64 - prev_non_nil_ts as i64;
+                    let epoch_change = current_epoch_change || epoch_from_nil;
+
+                    let (round_gap_summary, time_gap_summary) = if epoch_change {
+                        (&mut epoch_round_gap, &mut epoch_time_gap)
+                    } else {
+                        (&mut non_epoch_round_gap, &mut non_epoch_time_gap)
+                    };
+
+                    round_gap_summary.observe(round_gap as f32, block.version);
+
+                    if time_gap < 0 {
+                        error!(
+                            "Clock went backwards? {}, {:?}, {:?}",
+                            time_gap, block, prev_non_nil_block
+                        );
+                    } else {
+                        let time_gap_secs = Duration::from_micros(time_gap as u64).as_secs_f32();
+                        time_gap_summary.observe(time_gap_secs, block.version);
+                    }
+                }
+
+                failed_from_nil = 0;
+                epoch_from_nil = false;
+                prev_non_nil_ts = block.event.proposed_time();
+                prev_non_nil_block = Some(block);
+            }
+
+            previous_epooch = block.event.epoch();
+            previous_round = block.event.round();
+        }
+
+        MaxGapInfo {
+            non_epoch_round_gap,
+            epoch_round_gap,
+            non_epoch_time_gap,
+            epoch_time_gap,
+        }
     }
 
     pub fn analyze_gap<'a, I>(blocks: I) -> MaxGapInfo

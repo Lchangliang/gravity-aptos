@@ -9,8 +9,7 @@ use crate::{
     },
     dkg::DKGStartEvent,
     event::EventKey,
-    jwks::{jwk::JWKMoveStruct, rsa::RSA_JWK, unsupported::UnsupportedJWK, AllProvidersJWKs, ObservedJWKsUpdated, ProviderJWKs},
-    move_any::{Any, AsMoveAny},
+    jwks::ObservedJWKsUpdated,
     transaction::Version,
 };
 use anyhow::{bail, Error, Result};
@@ -25,7 +24,7 @@ use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{convert::TryFrom, ops::Deref, str::FromStr};
+use std::{convert::TryFrom, ops::Deref};
 
 pub static FEE_STATEMENT_EVENT_TYPE: Lazy<TypeTag> = Lazy::new(|| {
     TypeTag::Struct(Box::new(StructTag {
@@ -72,24 +71,19 @@ impl ContractEvent {
         sequence_number: u64,
         type_tag: TypeTag,
         event_data: Vec<u8>,
-    ) -> Self {
-        ContractEvent::V1(ContractEventV1::new(
+    ) -> anyhow::Result<Self> {
+        Ok(ContractEvent::V1(ContractEventV1::new(
             key,
             sequence_number,
             type_tag,
             event_data,
-        ))
+        )?))
     }
 
-    pub fn new_v2(type_tag: TypeTag, event_data: Vec<u8>) -> Self {
-        ContractEvent::V2(ContractEventV2::new(type_tag, event_data))
-    }
-
-    pub fn new_v2_with_type_tag_str(type_tag_str: &str, event_data: Vec<u8>) -> Self {
-        ContractEvent::V2(ContractEventV2::new(
-            TypeTag::from_str(type_tag_str).unwrap(),
-            event_data,
-        ))
+    pub fn new_v2(type_tag: TypeTag, event_data: Vec<u8>) -> anyhow::Result<Self> {
+        Ok(ContractEvent::V2(ContractEventV2::new(
+            type_tag, event_data,
+        )?))
     }
 
     pub fn event_key(&self) -> Option<&EventKey> {
@@ -114,10 +108,11 @@ impl ContractEvent {
     }
 
     pub fn size(&self) -> usize {
-        match self {
+        let result = match self {
             ContractEvent::V1(event) => event.size(),
             ContractEvent::V2(event) => event.size(),
-        }
+        };
+        result.expect("Size of events is computable and is checked at construction time")
     }
 
     pub fn is_v1(&self) -> bool {
@@ -169,6 +164,18 @@ impl ContractEvent {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
+impl ContractEvent {
+    /// Constructs a V2 event from a type tag string. Only used for tests or benchmarks. Panics if
+    /// type tag cannot be constructed from the string.
+    pub fn new_v2_with_type_tag_str(type_tag_str: &str, event_data: Vec<u8>) -> Self {
+        use std::str::FromStr;
+        ContractEvent::V2(
+            ContractEventV2::new(TypeTag::from_str(type_tag_str).unwrap(), event_data).unwrap(),
+        )
+    }
+}
+
 /// Entry produced via a call to the `emit_event` builtin.
 #[derive(Hash, Clone, Eq, PartialEq, Serialize, Deserialize, CryptoHasher)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
@@ -190,13 +197,17 @@ impl ContractEventV1 {
         sequence_number: u64,
         type_tag: TypeTag,
         event_data: Vec<u8>,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let event = Self {
             key,
             sequence_number,
             type_tag,
             event_data,
-        }
+        };
+
+        // Ensure size is "computable".
+        event.size()?;
+        Ok(event)
     }
 
     pub fn key(&self) -> &EventKey {
@@ -215,8 +226,9 @@ impl ContractEventV1 {
         &self.type_tag
     }
 
-    pub fn size(&self) -> usize {
-        self.key.size() + 8 /* u64 */ + bcs::serialized_size(&self.type_tag).unwrap() + self.event_data.len()
+    pub fn size(&self) -> anyhow::Result<usize> {
+        let size = self.key.size() + 8 /* u64 */ + bcs::serialized_size(&self.type_tag)? + self.event_data.len();
+        Ok(size)
     }
 }
 
@@ -244,15 +256,20 @@ pub struct ContractEventV2 {
 }
 
 impl ContractEventV2 {
-    pub fn new(type_tag: TypeTag, event_data: Vec<u8>) -> Self {
-        Self {
+    pub fn new(type_tag: TypeTag, event_data: Vec<u8>) -> anyhow::Result<Self> {
+        let event = Self {
             type_tag,
             event_data,
-        }
+        };
+
+        // Ensure size of event is "computable".
+        event.size()?;
+        Ok(event)
     }
 
-    pub fn size(&self) -> usize {
-        bcs::serialized_size(&self.type_tag).unwrap() + self.event_data.len()
+    pub fn size(&self) -> anyhow::Result<usize> {
+        let size = bcs::serialized_size(&self.type_tag)? + self.event_data.len();
+        Ok(size)
     }
 
     pub fn type_tag(&self) -> &TypeTag {

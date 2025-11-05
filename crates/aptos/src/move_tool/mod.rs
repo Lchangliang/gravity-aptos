@@ -5,16 +5,17 @@ use crate::{
     account::derive_resource_account::ResourceAccountSeed,
     common::{
         local_simulation,
+        transactions::TxnOptions,
         types::{
             load_account_arg, ArgWithTypeJSON, ChunkedPublishOption, CliConfig, CliError,
             CliTypedResult, ConfigSearchMode, EntryFunctionArguments, EntryFunctionArgumentsJSON,
-            MoveManifestAccountWrapper, MovePackageOptions, OverrideSizeCheckOption,
-            ProfileOptions, PromptOptions, RestOptions, SaveFile, ScriptFunctionArguments,
-            TransactionOptions, TransactionSummary, GIT_IGNORE,
+            LargePackagesModuleOption, MoveManifestAccountWrapper, MovePackageOptions,
+            OverrideSizeCheckOption, ProfileOptions, PromptOptions, RestOptions, SaveFile,
+            ScriptFunctionArguments, TransactionOptions, TransactionSummary, GIT_IGNORE,
         },
         utils::{
             check_if_file_exists, create_dir_if_not_exist, dir_default_to_current,
-            profile_or_submit, prompt_yes_with_override, write_to_file,
+            dispatch_transaction, prompt_yes_with_override, write_to_file,
         },
     },
     governance::CompileScriptFunction,
@@ -24,6 +25,7 @@ use crate::{
         fmt::Fmt,
         lint::LintPackage,
         manifest::{Dependency, ManifestNamedAddress, MovePackageManifest, PackageInfo},
+        sim::Sim,
     },
     CliCommand, CliResult,
 };
@@ -32,7 +34,6 @@ use aptos_crypto::HashValue;
 use aptos_framework::{
     chunked_publish::{
         chunk_package_and_create_payloads, large_packages_cleanup_staging_area, PublishType,
-        LARGE_PACKAGES_MODULE_ADDRESS,
     },
     docgen::DocgenOptions,
     extended_checks,
@@ -51,7 +52,9 @@ use aptos_types::{
     account_address::{create_resource_address, AccountAddress},
     object_address::create_object_code_deployment_address,
     on_chain_config::aptos_test_feature_flags_genesis,
-    transaction::{Transaction, TransactionArgument, TransactionPayload, TransactionStatus},
+    transaction::{
+        ReplayProtector, Transaction, TransactionArgument, TransactionPayload, TransactionStatus,
+    },
 };
 use aptos_vm::data_cache::AsMoveResolver;
 use async_trait::async_trait;
@@ -65,6 +68,7 @@ use move_model::metadata::{CompilerVersion, LanguageVersion};
 use move_package::{source_package::layout::SourcePackageLayout, BuildConfig, CompilerConfig};
 use move_unit_test::UnitTestingConfig;
 pub use package_hooks::*;
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -76,7 +80,6 @@ use std::{
 pub use stored_package::*;
 use tokio::task;
 use url::Url;
-
 pub mod aptos_debug_natives;
 mod bytecode;
 pub mod coverage;
@@ -85,6 +88,7 @@ mod lint;
 mod manifest;
 pub mod package_hooks;
 mod show;
+mod sim;
 pub mod stored_package;
 
 const HELLO_BLOCKCHAIN_EXAMPLE: &str = include_str!(
@@ -125,6 +129,7 @@ pub enum MoveTool {
     Publish(PublishPackage),
     Run(RunFunction),
     RunScript(RunScript),
+    Simulate(Simulate),
     #[clap(subcommand, hide = true)]
     Show(show::ShowTool),
     Test(TestPackage),
@@ -132,6 +137,8 @@ pub enum MoveTool {
     View(ViewFunction),
     Replay(Replay),
     Fmt(Fmt),
+    #[clap(subcommand)]
+    Sim(Sim),
 }
 
 impl MoveTool {
@@ -162,6 +169,7 @@ impl MoveTool {
             MoveTool::Publish(tool) => tool.execute_serialized().await,
             MoveTool::Run(tool) => tool.execute_serialized().await,
             MoveTool::RunScript(tool) => tool.execute_serialized().await,
+            MoveTool::Simulate(tool) => tool.execute_serialized().await,
             MoveTool::Show(tool) => tool.execute_serialized().await,
             MoveTool::Test(tool) => tool.execute_serialized().await,
             MoveTool::VerifyPackage(tool) => tool.execute_serialized().await,
@@ -169,6 +177,7 @@ impl MoveTool {
             MoveTool::Replay(tool) => tool.execute_serialized().await,
             MoveTool::Fmt(tool) => tool.execute_serialized().await,
             MoveTool::Lint(tool) => tool.execute_serialized().await,
+            MoveTool::Sim(tool) => tool.execute().await,
         }
     }
 }
@@ -592,7 +601,6 @@ impl CliCommand<&'static str> for TestPackage {
             config.clone(),
             UnitTestingConfig {
                 filter: self.filter.clone(),
-                report_stacktrace_on_abort: true,
                 report_storage_on_error: self.dump_state,
                 ignore_compile_warnings: self.ignore_compile_warnings,
                 named_address_values: self
@@ -838,7 +846,10 @@ impl AsyncTryInto<ChunkedPublishPayloads> for &PublishPackage {
             package,
             PublishType::AccountDeploy,
             None,
-            self.chunked_publish_option.large_packages_module_address,
+            self.chunked_publish_option
+                .large_packages_module
+                .large_packages_module_address(&self.txn_options.rest_client()?)
+                .await?,
             self.chunked_publish_option.chunk_size,
         )?;
 
@@ -1042,12 +1053,15 @@ impl CliCommand<TransactionSummary> for PublishPackage {
             submit_chunked_publish_transactions(
                 chunked_package_payloads.payloads,
                 &self.txn_options,
-                self.chunked_publish_option.large_packages_module_address,
+                self.chunked_publish_option
+                    .large_packages_module
+                    .large_packages_module_address(&self.txn_options.rest_client()?)
+                    .await?,
             )
             .await
         } else {
             let package_publication_data: PackagePublicationData = (&self).try_into()?;
-            profile_or_submit(package_publication_data.payload, &self.txn_options).await
+            dispatch_transaction(package_publication_data.payload, &self.txn_options).await
         }
     }
 }
@@ -1134,8 +1148,21 @@ impl CliCommand<TransactionSummary> for CreateObjectAndPublishPackage {
         "CreateObjectAndPublishPackage"
     }
 
+    // TODO[Ordereless]: Update this code to support stateless accounts that don't have a sequence number
     async fn execute(mut self) -> CliTypedResult<TransactionSummary> {
         let sender_address = self.txn_options.get_public_key_and_address()?.1;
+
+        let chunked_publish_large_packages_module_address =
+            if self.chunked_publish_option.chunked_publish {
+                Some(
+                    self.chunked_publish_option
+                        .large_packages_module
+                        .large_packages_module_address(&self.txn_options.rest_client()?)
+                        .await?,
+                )
+            } else {
+                None
+            };
 
         let sequence_number = if self.chunked_publish_option.chunked_publish {
             // Perform a preliminary build to determine the number of transactions needed for chunked publish mode.
@@ -1148,7 +1175,7 @@ impl CliCommand<TransactionSummary> for CreateObjectAndPublishPackage {
                 package,
                 PublishType::AccountDeploy,
                 None,
-                self.chunked_publish_option.large_packages_module_address,
+                chunked_publish_large_packages_module_address.unwrap(),
                 self.chunked_publish_option.chunk_size,
             )?
             .payloads;
@@ -1175,7 +1202,7 @@ impl CliCommand<TransactionSummary> for CreateObjectAndPublishPackage {
                 package,
                 PublishType::ObjectDeploy,
                 None,
-                self.chunked_publish_option.large_packages_module_address,
+                chunked_publish_large_packages_module_address.unwrap(),
                 self.chunked_publish_option.chunk_size,
             )?
             .payloads;
@@ -1191,7 +1218,7 @@ impl CliCommand<TransactionSummary> for CreateObjectAndPublishPackage {
             submit_chunked_publish_transactions(
                 payloads,
                 &self.txn_options,
-                self.chunked_publish_option.large_packages_module_address,
+                chunked_publish_large_packages_module_address.unwrap(),
             )
             .await
         } else {
@@ -1284,11 +1311,17 @@ impl CliCommand<TransactionSummary> for UpgradeObjectPackage {
         prompt_yes_with_override(&message, self.txn_options.prompt_options)?;
 
         let result = if self.chunked_publish_option.chunked_publish {
+            let chunked_publish_large_packages_module_address = self
+                .chunked_publish_option
+                .large_packages_module
+                .large_packages_module_address(&self.txn_options.rest_client()?)
+                .await?;
+
             let payloads = create_chunked_publish_payloads(
                 built_package,
                 PublishType::ObjectUpgrade,
                 Some(self.object_address),
-                self.chunked_publish_option.large_packages_module_address,
+                chunked_publish_large_packages_module_address,
                 self.chunked_publish_option.chunk_size,
             )?
             .payloads;
@@ -1303,7 +1336,7 @@ impl CliCommand<TransactionSummary> for UpgradeObjectPackage {
             submit_chunked_publish_transactions(
                 payloads,
                 &self.txn_options,
-                self.chunked_publish_option.large_packages_module_address,
+                chunked_publish_large_packages_module_address,
             )
             .await
         } else {
@@ -1367,8 +1400,22 @@ impl CliCommand<TransactionSummary> for DeployObjectCode {
         "DeployObject"
     }
 
+    // TODO[Ordereless]: Update this code to support stateless accounts that don't have a sequence number
     async fn execute(mut self) -> CliTypedResult<TransactionSummary> {
         let sender_address = self.txn_options.get_public_key_and_address()?.1;
+
+        let chunked_publish_large_packages_module_address =
+            if self.chunked_publish_option.chunked_publish {
+                Some(
+                    self.chunked_publish_option
+                        .large_packages_module
+                        .large_packages_module_address(&self.txn_options.rest_client()?)
+                        .await?,
+                )
+            } else {
+                None
+            };
+
         let sequence_number = if self.chunked_publish_option.chunked_publish {
             // Perform a preliminary build to determine the number of transactions needed for chunked publish mode.
             // This involves building the package with mock account address `0xcafe` to calculate the transaction count.
@@ -1380,7 +1427,7 @@ impl CliCommand<TransactionSummary> for DeployObjectCode {
                 package,
                 PublishType::AccountDeploy,
                 None,
-                self.chunked_publish_option.large_packages_module_address,
+                chunked_publish_large_packages_module_address.unwrap(),
                 self.chunked_publish_option.chunk_size,
             )?
             .payloads;
@@ -1407,7 +1454,7 @@ impl CliCommand<TransactionSummary> for DeployObjectCode {
                 package,
                 PublishType::ObjectDeploy,
                 None,
-                self.chunked_publish_option.large_packages_module_address,
+                chunked_publish_large_packages_module_address.unwrap(),
                 self.chunked_publish_option.chunk_size,
             )?
             .payloads;
@@ -1423,7 +1470,7 @@ impl CliCommand<TransactionSummary> for DeployObjectCode {
             submit_chunked_publish_transactions(
                 payloads,
                 &self.txn_options,
-                self.chunked_publish_option.large_packages_module_address,
+                chunked_publish_large_packages_module_address.unwrap(),
             )
             .await
         } else {
@@ -1522,11 +1569,17 @@ impl CliCommand<TransactionSummary> for UpgradeCodeObject {
         prompt_yes_with_override(&message, self.txn_options.prompt_options)?;
 
         let result = if self.chunked_publish_option.chunked_publish {
+            let chunked_publish_large_packages_module_address = self
+                .chunked_publish_option
+                .large_packages_module
+                .large_packages_module_address(&self.txn_options.rest_client()?)
+                .await?;
+
             let payloads = create_chunked_publish_payloads(
                 package,
                 PublishType::ObjectUpgrade,
                 Some(self.object_address),
-                self.chunked_publish_option.large_packages_module_address,
+                chunked_publish_large_packages_module_address,
                 self.chunked_publish_option.chunk_size,
             )?
             .payloads;
@@ -1541,7 +1594,7 @@ impl CliCommand<TransactionSummary> for UpgradeCodeObject {
             submit_chunked_publish_transactions(
                 payloads,
                 &self.txn_options,
-                self.chunked_publish_option.large_packages_module_address,
+                chunked_publish_large_packages_module_address,
             )
             .await
         } else {
@@ -1600,7 +1653,7 @@ async fn submit_chunked_publish_transactions(
     let payloads_length = payloads.len() as u64;
     let mut tx_hashes = vec![];
 
-    let account_address = txn_options.profile_options.account_address()?;
+    let (_, account_address) = txn_options.get_public_key_and_address()?;
 
     if !is_staging_area_empty(txn_options, large_packages_module_address).await? {
         let message = format!(
@@ -1666,12 +1719,12 @@ async fn is_staging_area_empty(
     txn_options: &TransactionOptions,
     large_packages_module_address: AccountAddress,
 ) -> CliTypedResult<bool> {
-    let url = txn_options.rest_options.url(&txn_options.profile_options)?;
-    let client = Client::new(url);
+    let client = txn_options.rest_client()?;
 
+    let (_, account_address) = txn_options.get_public_key_and_address()?;
     let staging_area_response = client
         .get_account_resource(
-            txn_options.profile_options.account_address()?,
+            account_address,
             &format!(
                 "{}::large_packages::StagingArea",
                 large_packages_module_address
@@ -1699,9 +1752,8 @@ pub struct ClearStagingArea {
     #[clap(flatten)]
     pub(crate) txn_options: TransactionOptions,
 
-    /// Address of the `large_packages` move module for chunked publishing
-    #[clap(long, default_value = LARGE_PACKAGES_MODULE_ADDRESS, value_parser = crate::common::types::load_account_arg)]
-    pub(crate) large_packages_module_address: AccountAddress,
+    #[clap(flatten)]
+    pub(crate) large_packages_module: LargePackagesModuleOption,
 }
 
 #[async_trait]
@@ -1711,12 +1763,17 @@ impl CliCommand<TransactionSummary> for ClearStagingArea {
     }
 
     async fn execute(self) -> CliTypedResult<TransactionSummary> {
+        let (_, account_address) = self.txn_options.get_public_key_and_address()?;
+
+        let large_packages_module_address = self
+            .large_packages_module
+            .large_packages_module_address(&self.txn_options.rest_client()?)
+            .await?;
         println!(
             "Cleaning up resource {}::large_packages::StagingArea under account {}.",
-            &self.large_packages_module_address,
-            self.txn_options.profile_options.account_address()?
+            &large_packages_module_address, account_address,
         );
-        let payload = large_packages_cleanup_staging_area(self.large_packages_module_address);
+        let payload = large_packages_cleanup_staging_area(large_packages_module_address);
         self.txn_options
             .submit_transaction(payload)
             .await
@@ -2084,11 +2141,49 @@ impl CliCommand<TransactionSummary> for RunFunction {
     }
 
     async fn execute(self) -> CliTypedResult<TransactionSummary> {
-        profile_or_submit(
+        dispatch_transaction(
             TransactionPayload::EntryFunction(self.entry_function_args.try_into()?),
             &self.txn_options,
         )
         .await
+    }
+}
+
+/// BETA: Simulate a Move function or script
+///
+/// BETA: subject to change
+///
+/// This allows you to simulate and see the output from any function or Move script all in one command.
+/// It additionally lets you simulate for any account
+///
+/// TODO: This should be simpler than the rest of the commands, soon to move other commands to a flow like this
+#[derive(Parser)]
+pub struct Simulate {
+    #[clap(flatten)]
+    txn_options: TxnOptions,
+    // TODO: Mix entry function and script together with some smarts
+    #[clap(flatten)]
+    entry_function_args: EntryFunctionArguments,
+
+    #[clap(long)]
+    local: bool,
+}
+
+#[async_trait]
+impl CliCommand<TransactionSummary> for Simulate {
+    fn command_name(&self) -> &'static str {
+        "Simulate"
+    }
+
+    async fn execute(self) -> CliTypedResult<TransactionSummary> {
+        let payload = TransactionPayload::EntryFunction(self.entry_function_args.try_into()?);
+
+        if self.local {
+            self.txn_options.simulate_locally(payload).await
+        } else {
+            let mut rng = rand::rngs::StdRng::from_entropy();
+            self.txn_options.simulate_remotely(&mut rng, payload).await
+        }
     }
 }
 
@@ -2136,7 +2231,7 @@ impl CliCommand<TransactionSummary> for RunScript {
             .compile_proposal_args
             .compile("RunScript", self.txn_options.prompt_options)?;
 
-        profile_or_submit(
+        dispatch_transaction(
             self.script_function_args.create_script_payload(bytecode)?,
             &self.txn_options,
         )
@@ -2150,6 +2245,21 @@ pub enum ReplayNetworkSelection {
     Testnet,
     Devnet,
     RestEndpoint(String),
+}
+
+impl ReplayNetworkSelection {
+    pub fn to_base_url(&self) -> CliTypedResult<AptosBaseUrl> {
+        match self {
+            ReplayNetworkSelection::Mainnet => Ok(AptosBaseUrl::Mainnet),
+            ReplayNetworkSelection::Testnet => Ok(AptosBaseUrl::Testnet),
+            ReplayNetworkSelection::Devnet => Ok(AptosBaseUrl::Devnet),
+            ReplayNetworkSelection::RestEndpoint(url) => {
+                Ok(AptosBaseUrl::Custom(Url::parse(url).map_err(|e| {
+                    CliError::UnableToParse("url", e.to_string())
+                })?))
+            },
+        }
+    }
 }
 
 /// Replay a comitted transaction using a local VM.
@@ -2204,26 +2314,14 @@ impl CliCommand<TransactionSummary> for Replay {
     }
 
     async fn execute(self) -> CliTypedResult<TransactionSummary> {
-        use ReplayNetworkSelection::*;
-
         if self.profile_gas && self.benchmark {
             return Err(CliError::UnexpectedError(
                 "Cannot perform benchmarking and gas profiling at the same time.".to_string(),
             ));
         }
 
-        let rest_endpoint = match &self.network {
-            Mainnet => "https://fullnode.mainnet.aptoslabs.com",
-            Testnet => "https://fullnode.testnet.aptoslabs.com",
-            Devnet => "https://fullnode.devnet.aptoslabs.com",
-            RestEndpoint(url) => url,
-        };
-
         // Build the client
-        let client = Client::builder(AptosBaseUrl::Custom(
-            Url::parse(rest_endpoint)
-                .map_err(|_err| CliError::UnableToParse("url", rest_endpoint.to_string()))?,
-        ));
+        let client = Client::builder(self.network.to_base_url()?);
 
         // add the node API key if it is provided
         let client = if let Some(api_key) = self.node_api_key {
@@ -2309,7 +2407,11 @@ impl CliCommand<TransactionSummary> for Replay {
             gas_unit_price: Some(txn.gas_unit_price()),
             pending: None,
             sender: Some(txn.sender()),
-            sequence_number: Some(txn.sequence_number()),
+            sequence_number: match txn.replay_protector() {
+                ReplayProtector::SequenceNumber(sequence_number) => Some(sequence_number),
+                _ => None,
+            },
+            replay_protector: Some(txn.replay_protector()),
             success,
             timestamp_us: None,
             version: Some(self.txn_id),

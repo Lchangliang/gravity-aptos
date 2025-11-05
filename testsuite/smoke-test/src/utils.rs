@@ -2,6 +2,8 @@
 // Parts of the project are originally copyright © Meta Platforms, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::aptos_cli::validator::generate_blob;
+use aptos::test::CliTestFramework;
 use aptos_cached_packages::aptos_stdlib;
 use aptos_config::{
     config::{NodeConfig, Peer, PeerRole, HANDSHAKE_VERSION},
@@ -277,10 +279,39 @@ pub async fn get_current_version(rest_client: &RestClient) -> u64 {
 
 pub async fn get_on_chain_resource<T: OnChainConfig>(rest_client: &Client) -> T {
     let maybe_response = rest_client
-        .get_account_resource_bcs::<T>(CORE_CODE_ADDRESS, T::struct_tag().to_string().as_str())
+        .get_account_resource_bcs::<T>(
+            CORE_CODE_ADDRESS,
+            T::struct_tag().to_canonical_string().as_str(),
+        )
         .await;
     let response = maybe_response.unwrap();
     response.into_inner()
+}
+
+/// Updates the consensus config
+pub async fn update_consensus_config(
+    cli: &CliTestFramework,
+    root_cli_index: usize,
+    new_consensus_config: OnChainConsensusConfig,
+) {
+    let update_consensus_config_script = format!(
+        r#"
+    script {{
+        use aptos_framework::aptos_governance;
+        use aptos_framework::consensus_config;
+        fun main(core_resources: &signer) {{
+            let framework_signer = aptos_governance::get_signer_testnet_only(core_resources, @0000000000000000000000000000000000000000000000000000000000000001);
+            let config_bytes = {};
+            consensus_config::set_for_next_epoch(&framework_signer, config_bytes);
+            aptos_governance::force_end_epoch(&framework_signer);
+        }}
+    }}
+    "#,
+        generate_blob(&bcs::to_bytes(&new_consensus_config).unwrap())
+    );
+    cli.run_script(root_cli_index, &update_consensus_config_script)
+        .await
+        .unwrap();
 }
 
 #[cfg(test)]

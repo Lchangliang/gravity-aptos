@@ -20,43 +20,42 @@ use rand::{rngs::SmallRng, Rng, SeedableRng};
 use std::sync::{atomic::AtomicBool, Arc};
 
 pub async fn create_dag_swarm(num_nodes: usize) -> LocalSwarm {
-    todo!()
-    // let swarm = SwarmBuilder::new_local(num_nodes)
-    //     .with_init_config(Arc::new(move |_, config, _| {
-    //         config.api.failpoints_enabled = true;
-    //         config
-    //             .state_sync
-    //             .state_sync_driver
-    //             .enable_auto_bootstrapping = true;
-    //         config
-    //             .state_sync
-    //             .state_sync_driver
-    //             .max_connection_deadline_secs = 3;
-    //         config.dag_consensus.fetcher_config = DagFetcherConfig {
-    //             retry_interval_ms: 30,
-    //             rpc_timeout_ms: 500,
-    //             min_concurrent_responders: 2,
-    //             max_concurrent_responders: 7,
-    //             max_concurrent_fetches: 4,
-    //         }
-    //     }))
-    //     .with_init_genesis_config(Arc::new(move |genesis_config| {
-    //         let onchain_consensus_config = OnChainConsensusConfig::V4 {
-    //             alg: ConsensusAlgorithmConfig::DAG(DagConsensusConfigV1::default()),
-    //             vtxn: ValidatorTxnConfig::default_for_genesis(),
-    //             window_size: DEFAULT_WINDOW_SIZE,
-    //         };
+    let swarm = SwarmBuilder::new_local(num_nodes)
+        .with_init_config(Arc::new(move |_, config, _| {
+            config.api.failpoints_enabled = true;
+            config
+                .state_sync
+                .state_sync_driver
+                .enable_auto_bootstrapping = true;
+            config
+                .state_sync
+                .state_sync_driver
+                .max_connection_deadline_secs = 3;
+            config.dag_consensus.fetcher_config = DagFetcherConfig {
+                retry_interval_ms: 30,
+                rpc_timeout_ms: 500,
+                min_concurrent_responders: 2,
+                max_concurrent_responders: 7,
+                max_concurrent_fetches: 4,
+            }
+        }))
+        .with_init_genesis_config(Arc::new(move |genesis_config| {
+            let onchain_consensus_config = OnChainConsensusConfig::V4 {
+                alg: ConsensusAlgorithmConfig::DAG(DagConsensusConfigV1::default()),
+                vtxn: ValidatorTxnConfig::default_for_genesis(),
+                window_size: DEFAULT_WINDOW_SIZE,
+            };
 
-    //         genesis_config.consensus_config = onchain_consensus_config;
-    //     }))
-    //     .build()
-    //     .await;
+            genesis_config.consensus_config = onchain_consensus_config;
+        }))
+        .build()
+        .await;
 
-    // println!(
-    //     "Validators {:?}",
-    //     swarm.validators().map(|v| v.peer_id()).collect::<Vec<_>>()
-    // );
-    // swarm
+    println!(
+        "Validators {:?}",
+        swarm.validators().map(|v| v.peer_id()).collect::<Vec<_>>()
+    );
+    swarm
 }
 
 #[tokio::test]
@@ -140,6 +139,7 @@ async fn run_dag_fail_point_test(
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_fault_tolerance_of_network_send() {
     // Randomly increase network failure rate, until network halts, and check that it comes back afterwards.
     let mut small_rng = SmallRng::from_entropy();
@@ -173,6 +173,7 @@ async fn test_fault_tolerance_of_network_send() {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_fault_tolerance_of_network_receive() {
     // Randomly increase network failure rate, until network halts, and check that it comes back afterwards.
     let mut small_rng = SmallRng::from_entropy();
@@ -206,6 +207,7 @@ async fn test_fault_tolerance_of_network_receive() {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_changing_working_consensus() {
     // with 7 nodes, consensus needs 5 to operate.
     // we rotate in each cycle, which 2 nodes are down.

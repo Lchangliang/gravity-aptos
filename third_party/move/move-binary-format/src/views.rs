@@ -251,7 +251,7 @@ pub struct FunctionHandleView<'a, T> {
     function_handle: &'a FunctionHandle,
 }
 
-impl<'a, T> Clone for FunctionHandleView<'a, T> {
+impl<T> Clone for FunctionHandleView<'_, T> {
     fn clone(&self) -> Self {
         Self {
             module: self.module,
@@ -329,6 +329,10 @@ impl<'a, T: ModuleAccess> FunctionHandleView<'a, T> {
 
     pub fn attributes(&self) -> &[FunctionAttribute] {
         &self.function_handle.attributes
+    }
+
+    pub fn access_specifiers(&self) -> Option<&Vec<AccessSpecifier>> {
+        self.function_handle.access_specifiers.as_ref()
     }
 }
 
@@ -478,7 +482,7 @@ pub struct FunctionDefinitionView<'a, T> {
     function_handle_view: FunctionHandleView<'a, T>,
 }
 
-impl<'a, T> Clone for FunctionDefinitionView<'a, T> {
+impl<T> Clone for FunctionDefinitionView<'_, T> {
     fn clone(&self) -> Self {
         Self {
             module: self.module,
@@ -509,6 +513,10 @@ impl<'a, T: ModuleAccess> FunctionDefinitionView<'a, T> {
 
     pub fn attributes(&self) -> &[FunctionAttribute] {
         self.function_handle_view.attributes()
+    }
+
+    pub fn acquired_resources(&self) -> &[StructDefinitionIndex] {
+        &self.function_def.acquires_global_resources
     }
 
     pub fn is_entry(&self) -> bool {

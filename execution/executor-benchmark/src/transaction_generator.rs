@@ -8,6 +8,7 @@ use crate::{
 };
 use aptos_crypto::ed25519::Ed25519PrivateKey;
 use aptos_logger::info;
+use aptos_metrics_core::{IntCounterVecHelper, TimerHelper};
 use aptos_sdk::{
     transaction_builder::{aptos_stdlib, TransactionFactory},
     types::LocalAccount,
@@ -20,11 +21,12 @@ use aptos_types::{
     account_config::{aptos_test_root_address, AccountResource},
     chain_id::ChainId,
     state_store::MoveResourceExt,
-    transaction::Transaction,
+    transaction::{EntryFunction, Transaction, TransactionPayload},
 };
 use chrono::Local;
 use indicatif::{ProgressBar, ProgressStyle};
 use itertools::Itertools;
+use move_core_types::{ident_str, language_storage::ModuleId};
 #[cfg(test)]
 use rand::SeedableRng;
 use rand::{rngs::StdRng, seq::SliceRandom, thread_rng, Rng};
@@ -220,7 +222,9 @@ impl TransactionGenerator {
 
     pub fn create_transaction_factory() -> TransactionFactory {
         TransactionFactory::new(ChainId::test())
-            .with_transaction_expiration_time(300)
+            // executor benchmark doesn't have BlockMetadata txns, time doesn't pass for it
+            // so we need to use absolute timestamp (so orderless txns are not rejected as too far in the future)
+            .with_absolute_transaction_expiration_timestamp(30)
             .with_gas_unit_price(100)
     }
 
@@ -320,8 +324,7 @@ impl TransactionGenerator {
         let last_non_empty_phase = Arc::new(AtomicUsize::new(0));
         let transaction_generators = Mutex::new(transaction_generators);
         assert!(self.block_sender.is_some());
-        let num_senders_per_block =
-            (block_size + transactions_per_sender - 1) / transactions_per_sender;
+        let num_senders_per_block = block_size.div_ceil(transactions_per_sender);
         let account_pool_size = self.main_signer_accounts.as_ref().unwrap().accounts.len();
         let transaction_generator = ThreadLocal::with_capacity(self.num_workers);
         for i in 0..num_blocks {
@@ -448,10 +451,20 @@ impl TransactionGenerator {
                 Arc::new(AtomicUsize::new(0)),
                 |(sender_idx, new_account), account_cache| {
                     let sender = &account_cache.accounts[sender_idx];
-                    let payload = aptos_stdlib::aptos_account_transfer(
-                        new_account.authentication_key().account_address(),
-                        init_account_balance,
-                    );
+                    // Use special function to both transfer, and create account resource.
+                    let payload = TransactionPayload::EntryFunction(EntryFunction::new(
+                        ModuleId::new(
+                            AccountAddress::SEVEN,
+                            ident_str!("benchmark_utils").to_owned(),
+                        ),
+                        ident_str!("transfer_and_create_account").to_owned(),
+                        vec![],
+                        vec![
+                            bcs::to_bytes(&new_account.authentication_key().account_address())
+                                .unwrap(),
+                            bcs::to_bytes(&init_account_balance).unwrap(),
+                        ],
+                    ));
                     let txn = sender
                         .sign_with_transaction_builder(self.transaction_factory.payload(payload));
                     Some(Transaction::UserTransaction(txn))
@@ -671,7 +684,7 @@ impl TransactionGenerator {
         F: Fn(T, &AccountCache) -> Option<Transaction> + Send + Sync,
         S: Fn(&T) -> usize,
     {
-        let _timer = TIMER.with_label_values(&["generate_block"]).start_timer();
+        let _timer = TIMER.timer_with(&["generate_block"]);
         let block_size = inputs.len();
         let mut jobs = Vec::new();
         jobs.resize_with(self.num_workers, BTreeMap::new);
@@ -729,9 +742,7 @@ impl TransactionGenerator {
             );
         }
 
-        NUM_TXNS
-            .with_label_values(&["generation_done"])
-            .inc_by(transactions.len() as u64);
+        NUM_TXNS.inc_with_by(&["generation_done"], transactions.len() as u64);
 
         if let Some(sender) = &self.block_sender {
             sender.send(transactions).unwrap();
@@ -801,8 +812,8 @@ impl TransactionGenerator {
                 assert_eq!(
                     AccountResource::fetch_move_resource(&db_state_view, &address)
                         .unwrap()
-                        .unwrap()
-                        .sequence_number(),
+                        .map(|acct| acct.sequence_number)
+                        .unwrap_or(0),
                     account.sequence_number()
                 );
                 bar.inc(1);

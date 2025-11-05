@@ -5,6 +5,8 @@
 extern crate core;
 
 #[cfg(test)]
+mod account_abstraction;
+#[cfg(test)]
 mod aptos;
 #[cfg(test)]
 mod aptos_cli;
@@ -37,6 +39,8 @@ mod network;
 #[cfg(test)]
 mod permissioned_delegation;
 #[cfg(test)]
+mod priority_fee;
+#[cfg(test)]
 mod randomness;
 #[cfg(test)]
 mod rest_api;
@@ -53,6 +57,8 @@ mod test_smoke_tests;
 #[cfg(test)]
 mod transaction;
 #[cfg(test)]
+mod transaction_filter;
+#[cfg(test)]
 mod txn_broadcast;
 #[cfg(test)]
 mod txn_emitter;
@@ -68,5 +74,7 @@ mod utils;
 #[cfg(test)]
 mod validator_txns;
 
+#[cfg(test)]
+mod execution_pool;
 #[cfg(test)]
 mod workspace_builder;

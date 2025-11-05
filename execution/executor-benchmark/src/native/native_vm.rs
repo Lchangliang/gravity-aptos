@@ -40,8 +40,8 @@ use aptos_types::{
     on_chain_config::FeatureFlag,
     state_store::{state_key::StateKey, state_value::StateValueMetadata, StateView},
     transaction::{
-        signature_verified_transaction::SignatureVerifiedTransaction, BlockOutput, Transaction,
-        TransactionOutput, TransactionStatus, WriteSetPayload,
+        signature_verified_transaction::SignatureVerifiedTransaction, AuxiliaryInfo, BlockOutput,
+        Transaction, TransactionOutput, TransactionStatus, WriteSetPayload,
     },
     write_set::WriteOp,
     AptosCoinType,
@@ -69,7 +69,7 @@ use move_core_types::{
 };
 use move_vm_types::delayed_values::delayed_field_id::DelayedFieldID;
 use serde::{de::DeserializeOwned, Serialize};
-use std::{collections::BTreeMap, fmt::Debug, sync::Arc, u128};
+use std::{collections::BTreeMap, fmt::Debug, sync::Arc};
 
 pub struct NativeVMBlockExecutor;
 
@@ -86,11 +86,11 @@ impl VMBlockExecutor for NativeVMBlockExecutor {
     /// transaction output.
     fn execute_block(
         &self,
-        txn_provider: &DefaultTxnProvider<SignatureVerifiedTransaction>,
+        txn_provider: &DefaultTxnProvider<SignatureVerifiedTransaction, AuxiliaryInfo>,
         state_view: &(impl StateView + Sync),
         onchain_config: BlockExecutorConfigFromOnchain,
         transaction_slice_metadata: TransactionSliceMetadata,
-    ) -> Result<BlockOutput<TransactionOutput>, VMStatus> {
+    ) -> Result<BlockOutput<SignatureVerifiedTransaction, TransactionOutput>, VMStatus> {
         AptosBlockExecutorWrapper::<NativeVMExecutorTask>::execute_block_on_thread_pool::<
             _,
             NoOpTransactionCommitHook<AptosTransactionOutput, VMStatus>,
@@ -118,6 +118,7 @@ pub(crate) struct NativeVMExecutorTask {
 }
 
 impl ExecutorTask for NativeVMExecutorTask {
+    type AuxiliaryInfo = AuxiliaryInfo;
     type Error = VMStatus;
     type Output = AptosTransactionOutput;
     type Txn = SignatureVerifiedTransaction;
@@ -147,22 +148,22 @@ impl ExecutorTask for NativeVMExecutorTask {
         &self,
         executor_with_group_view: &(impl ExecutorView + ResourceGroupView),
         txn: &SignatureVerifiedTransaction,
+        _auxiliary_info: &AuxiliaryInfo,
         _txn_idx: TxnIndex,
     ) -> ExecutionStatus<AptosTransactionOutput, VMStatus> {
-        let gas_units = 4;
-
         match self.execute_transaction_impl(
             executor_with_group_view,
             txn,
-            gas_units,
             self.fa_migration_complete,
         ) {
-            Ok(change_set) => ExecutionStatus::Success(AptosTransactionOutput::new(VMOutput::new(
-                change_set,
-                ModuleWriteSet::empty(),
-                FeeStatement::new(gas_units, gas_units, 0, 0, 0),
-                TransactionStatus::Keep(aptos_types::transaction::ExecutionStatus::Success),
-            ))),
+            Ok((change_set, gas_units)) => {
+                ExecutionStatus::Success(AptosTransactionOutput::new(VMOutput::new(
+                    change_set,
+                    ModuleWriteSet::empty(),
+                    FeeStatement::new(gas_units, gas_units, 0, 0, 0),
+                    TransactionStatus::Keep(aptos_types::transaction::ExecutionStatus::Success),
+                )))
+            },
             Err(_) => ExecutionStatus::SpeculativeExecutionAbortError("something".to_string()),
         }
     }
@@ -185,9 +186,9 @@ impl NativeVMExecutorTask {
         &self,
         view: &(impl ExecutorView + ResourceGroupView),
         txn: &SignatureVerifiedTransaction,
-        gas_units: u64,
         fa_migration_complete: bool,
-    ) -> Result<VMChangeSet, ()> {
+    ) -> Result<(VMChangeSet, u64), ()> {
+        let gas_units = 4;
         let gas = gas_units * 100;
 
         let mut resource_write_set = BTreeMap::new();
@@ -296,6 +297,7 @@ impl NativeVMExecutorTask {
                         recipient,
                         fail_on_account_existing,
                         fail_on_account_missing,
+                        !fa_migration_complete,
                         view,
                         &mut resource_write_set,
                     )?;
@@ -344,25 +346,32 @@ impl NativeVMExecutorTask {
                             recipient_address,
                             fail_on_recipient_account_existing,
                             fail_on_recipient_account_missing,
+                            !fa_migration_complete,
                             view,
                             &mut resource_write_set,
                         )?;
                     }
                 }
             },
+            NativeTransaction::BlockEpilogue => return Ok((VMChangeSet::empty(), 0)),
         };
 
         events.push((
-            FeeStatement::new(gas_units, gas_units, 0, 0, 0).create_event_v2(),
+            FeeStatement::new(gas_units, gas_units, 0, 0, 0)
+                .create_event_v2()
+                .expect("Creating FeeStatement should always succeed"),
             None,
         ));
 
-        Ok(VMChangeSet::new(
-            resource_write_set,
-            events,
-            delayed_field_change_set,
-            aggregator_v1_write_set,
-            aggregator_v1_delta_set,
+        Ok((
+            VMChangeSet::new(
+                resource_write_set,
+                events,
+                delayed_field_change_set,
+                aggregator_v1_write_set,
+                aggregator_v1_delta_set,
+            ),
+            gas_units,
         ))
     }
 
@@ -432,8 +441,23 @@ impl NativeVMExecutorTask {
                 }
             },
             None => {
-                error!("Account doesn't exist");
-                Err(())
+                let mut account = DbAccessUtil::new_account_resource(sender_address);
+                if sequence_number == 0 {
+                    account.sequence_number = 1;
+                    resource_write_set.insert(
+                        sender_account_key,
+                        AbstractResourceWriteOp::Write(WriteOp::legacy_creation(Bytes::from(
+                            bcs::to_bytes(&account).map_err(hide_error)?,
+                        ))),
+                    );
+                    Ok(())
+                } else {
+                    error!(
+                        "Invalid sequence number: txn: {} vs account: {}",
+                        sequence_number, account.sequence_number
+                    );
+                    Err(())
+                }
             },
         }
     }
@@ -443,6 +467,7 @@ impl NativeVMExecutorTask {
         address: AccountAddress,
         fail_on_account_existing: bool,
         fail_on_account_missing: bool,
+        create_account_resource: bool,
         view: &(impl ExecutorView + ResourceGroupView),
         resource_write_set: &mut BTreeMap<StateKey, AbstractResourceWriteOp>,
     ) -> Result<(), ()> {
@@ -458,7 +483,7 @@ impl NativeVMExecutorTask {
             None => {
                 if fail_on_account_missing {
                     return Err(());
-                } else {
+                } else if create_account_resource {
                     let account = DbAccessUtil::new_account_resource(address);
 
                     resource_write_set.insert(
@@ -529,8 +554,7 @@ impl NativeVMExecutorTask {
         );
         let materialized_size = view
             .get_resource_state_value_size(&apt_metadata_object_state_key)
-            .map_err(hide_error)?
-            .unwrap();
+            .map_err(hide_error)?;
         let metadata = view
             .get_resource_state_value_metadata(&apt_metadata_object_state_key)
             .map_err(hide_error)?
@@ -638,7 +662,8 @@ impl NativeVMExecutorTask {
                                 store: sender_store_address,
                                 amount: transfer_amount,
                             }
-                            .create_event_v2(),
+                            .create_event_v2()
+                            .expect("Creating WithdrawFAEvent should always succeed"),
                             None,
                         ));
                     }
@@ -791,7 +816,12 @@ impl NativeVMExecutorTask {
                 store: recipient_store_address,
                 amount: transfer_amount,
             };
-            events.push((event.create_event_v2(), None));
+            events.push((
+                event
+                    .create_event_v2()
+                    .expect("Creating DepositFAEvent should always succeed"),
+                None,
+            ));
         }
         Ok(existed)
     }
@@ -820,7 +850,8 @@ impl NativeVMExecutorTask {
                             type_info: DbAccessUtil::new_type_info_resource::<AptosCoinType>()
                                 .map_err(hide_error)?,
                         }
-                        .create_event_v2(),
+                        .create_event_v2()
+                        .expect("Creating CoinRegister should always succeed"),
                         None,
                     ));
                     (

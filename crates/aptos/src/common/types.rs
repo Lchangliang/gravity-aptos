@@ -6,11 +6,13 @@ use crate::{
     common::{
         init::Network,
         local_simulation,
+        transactions::ReplayProtectionType,
         utils::{
-            check_if_file_exists, create_dir_if_not_exist, deserialize_private_key_with_prefix,
-            dir_default_to_current, get_account_with_state, get_auth_key, get_sequence_number,
-            parse_json_file, prompt_yes_with_override, read_from_file, start_logger,
-            to_common_result, to_common_success_result, write_to_file, write_to_file_with_opts,
+            check_if_file_exists, create_dir_if_not_exist, deserialize_address_str,
+            deserialize_material_with_prefix, dir_default_to_current, get_account_with_state,
+            get_auth_key, get_sequence_number, parse_json_file, prompt_yes_with_override,
+            read_from_file, serialize_material_with_prefix, start_logger, to_common_result,
+            to_common_success_result, write_to_file, write_to_file_with_opts,
             write_to_user_only_file,
         },
     },
@@ -25,7 +27,9 @@ use aptos_crypto::{
     encoding_type::{EncodingError, EncodingType},
     x25519, PrivateKey, ValidCryptoMaterialStringExt,
 };
-use aptos_framework::chunked_publish::{CHUNK_SIZE_IN_BYTES, LARGE_PACKAGES_MODULE_ADDRESS};
+use aptos_framework::chunked_publish::{
+    default_large_packages_module_address, CHUNK_SIZE_IN_BYTES,
+};
 use aptos_global_constants::adjust_gas_headroom;
 use aptos_keygen::KeyGen;
 use aptos_logger::Level;
@@ -39,11 +43,15 @@ use aptos_sdk::{
     transaction_builder::TransactionFactory,
     types::{HardwareWalletAccount, HardwareWalletType, LocalAccount, TransactionSigner},
 };
+use aptos_transaction_simulation::SimulationStateStore;
+use aptos_transaction_simulation_session::Session;
 use aptos_types::{
+    account_config::AccountResource,
     chain_id::ChainId,
     transaction::{
-        authenticator::AuthenticationKey, EntryFunction, MultisigTransactionPayload, Script,
-        SignedTransaction, TransactionArgument, TransactionPayload, TransactionStatus,
+        authenticator::AuthenticationKey, EntryFunction, MultisigTransactionPayload,
+        ReplayProtector, Script, SignedTransaction, TransactionArgument, TransactionPayload,
+        TransactionStatus,
     },
 };
 use aptos_vm_types::output::VMOutput;
@@ -64,19 +72,20 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
+    cmp::max,
     collections::BTreeMap,
     convert::TryFrom,
     fmt::{Debug, Display, Formatter},
     fs::OpenOptions,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::FromStr,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 
 pub const USER_AGENT: &str = concat!("aptos-cli/", env!("CARGO_PKG_VERSION"));
-const US_IN_SECS: u64 = 1_000_000;
-const ACCEPTED_CLOCK_SKEW_US: u64 = 5 * US_IN_SECS;
+pub const US_IN_SECS: u64 = 1_000_000;
+pub const ACCEPTED_CLOCK_SKEW_US: u64 = 5 * US_IN_SECS;
 pub const DEFAULT_EXPIRATION_SECS: u64 = 30;
 pub const DEFAULT_PROFILE: &str = "default";
 pub const GIT_IGNORE: &str = ".gitignore";
@@ -267,14 +276,22 @@ pub struct ProfileConfig {
     #[serde(
         skip_serializing_if = "Option::is_none",
         default,
-        deserialize_with = "deserialize_private_key_with_prefix"
+        serialize_with = "serialize_material_with_prefix",
+        deserialize_with = "deserialize_material_with_prefix"
     )]
     pub private_key: Option<Ed25519PrivateKey>,
     /// Public key for commands
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_material_with_prefix",
+        deserialize_with = "deserialize_material_with_prefix"
+    )]
     pub public_key: Option<Ed25519PublicKey>,
     /// Account for commands
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_address_str"
+    )]
     pub account: Option<AccountAddress>,
     /// URL for the Aptos rest endpoint
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -290,10 +307,19 @@ pub struct ProfileConfig {
 /// ProfileConfig but without the private parts
 #[derive(Debug, Serialize)]
 pub struct ProfileSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<Network>,
     pub has_private_key: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_material_with_prefix",
+        deserialize_with = "deserialize_material_with_prefix"
+    )]
     pub public_key: Option<Ed25519PublicKey>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_address_str"
+    )]
     pub account: Option<AccountAddress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rest_url: Option<String>,
@@ -304,6 +330,7 @@ pub struct ProfileSummary {
 impl From<&ProfileConfig> for ProfileSummary {
     fn from(config: &ProfileConfig) -> Self {
         ProfileSummary {
+            network: config.network,
             has_private_key: config.private_key.is_some(),
             public_key: config.public_key.clone(),
             account: config.account,
@@ -605,7 +632,7 @@ impl PromptOptions {
 }
 
 /// An insertable option for use with encodings.
-#[derive(Debug, Default, Parser)]
+#[derive(Debug, Default, Parser, Clone, Copy)]
 pub struct EncodingOptions {
     /// Encoding of data as one of [base64, bcs, hex]
     #[clap(long, default_value_t = EncodingType::Hex)]
@@ -670,7 +697,7 @@ impl PublicKeyInputOptions {
     }
 }
 
-impl ExtractPublicKey for PublicKeyInputOptions {
+impl ExtractEd25519PublicKey for PublicKeyInputOptions {
     fn extract_public_key(
         &self,
         encoding: EncodingType,
@@ -697,7 +724,7 @@ impl ExtractPublicKey for PublicKeyInputOptions {
     }
 }
 
-pub trait ParsePrivateKey {
+pub trait ParseEd25519PrivateKey {
     fn parse_private_key(
         &self,
         encoding: EncodingType,
@@ -766,7 +793,7 @@ pub struct PrivateKeyInputOptions {
     private_key: Option<String>,
 }
 
-impl ParsePrivateKey for PrivateKeyInputOptions {}
+impl ParseEd25519PrivateKey for PrivateKeyInputOptions {}
 
 impl PrivateKeyInputOptions {
     pub fn from_private_key(private_key: &Ed25519PrivateKey) -> CliTypedResult<Self> {
@@ -798,12 +825,16 @@ impl PrivateKeyInputOptions {
         }
     }
 
+    pub fn has_key_or_file(&self) -> bool {
+        self.private_key.is_some() || self.private_key_file.is_some()
+    }
+
     /// Extract public key from CLI args with fallback to config
     /// This will first try to extract public key from private_key from CLI args
     /// With fallback to profile
     /// NOTE: Use this function instead of 'extract_private_key_and_address' if this is HardwareWallet profile
     /// HardwareWallet profile does not have private key in config
-    pub fn extract_public_key_and_address(
+    pub fn extract_ed25519_public_key_and_address(
         &self,
         encoding: EncodingType,
         profile: &ProfileOptions,
@@ -834,6 +865,44 @@ impl PrivateKeyInputOptions {
                     let address = account_address_from_public_key(&public_key);
                     Ok((public_key, address))
                 },
+            }
+        } else {
+            Err(CliError::CommandArgumentError(
+                "One of ['--private-key', '--private-key-file'], or ['public_key'] must present in profile".to_string(),
+            ))
+        }
+    }
+
+    /// Extract address
+    pub fn extract_address(
+        &self,
+        encoding: EncodingType,
+        profile: &ProfileOptions,
+        maybe_address: Option<AccountAddress>,
+    ) -> CliTypedResult<AccountAddress> {
+        // Order of operations
+        // 1. CLI inputs
+        // 2. Profile
+        // 3. Derived
+        if let Some(address) = maybe_address {
+            return Ok(address);
+        }
+
+        if let Some(private_key) = self.extract_private_key_cli(encoding)? {
+            // If we use the CLI inputs, then we should derive or use the address from the input
+            let address = account_address_from_public_key(&private_key.public_key());
+            Ok(address)
+        } else if let Some((Some(public_key), maybe_config_address)) = CliConfig::load_profile(
+            profile.profile_name(),
+            ConfigSearchMode::CurrentDirAndParents,
+        )?
+        .map(|p| (p.public_key, p.account))
+        {
+            if let Some(address) = maybe_config_address {
+                Ok(address)
+            } else {
+                let address = account_address_from_public_key(&public_key);
+                Ok(address)
             }
         } else {
             Err(CliError::CommandArgumentError(
@@ -915,6 +984,18 @@ impl PrivateKeyInputOptions {
             self.private_key.clone(),
         )
     }
+
+    pub fn extract_private_key_input_from_cli_args(&self) -> CliTypedResult<Vec<u8>> {
+        if let Some(ref file) = self.private_key_file {
+            read_from_file(file)
+        } else if let Some(ref key) = self.private_key {
+            Ok(strip_private_key_prefix(key)?.as_bytes().to_vec())
+        } else {
+            Err(CliError::CommandArgumentError(
+                "No --private-key or --private-key-file provided".to_string(),
+            ))
+        }
+    }
 }
 
 // Extract the public key by deriving private key, fall back to public key from profile
@@ -922,7 +1003,7 @@ impl PrivateKeyInputOptions {
 // 1. Get the private key (either from CLI input or profile), and derive the public key from it
 // 2. Else get the public key directly from the config profile
 // 3. Else error
-impl ExtractPublicKey for PrivateKeyInputOptions {
+impl ExtractEd25519PublicKey for PrivateKeyInputOptions {
     fn extract_public_key(
         &self,
         encoding: EncodingType,
@@ -961,7 +1042,7 @@ impl ExtractPublicKey for PrivateKeyInputOptions {
     }
 }
 
-pub trait ExtractPublicKey {
+pub trait ExtractEd25519PublicKey {
     fn extract_public_key(
         &self,
         encoding: EncodingType,
@@ -978,7 +1059,7 @@ pub fn account_address_from_auth_key(auth_key: &AuthenticationKey) -> AccountAdd
     AccountAddress::new(*auth_key.account_address())
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, Parser, Clone)]
 pub struct SaveFile {
     /// Output file path
     #[clap(long, value_parser)]
@@ -1102,7 +1183,7 @@ impl FromStr for OptimizationLevel {
             "" | "default" => Ok(Self::Default),
             "extra" => Ok(Self::Extra),
             _ => bail!(
-                "unrecognized optimization level `{}` (supported versions: `none`, `default`, `aggressive`)",
+                "unrecognized optimization level `{}` (supported versions: `none`, `default`, `extra`)",
                 s
             ),
         }
@@ -1421,6 +1502,8 @@ pub struct TransactionSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence_number: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_protector: Option<ReplayProtector>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub success: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp_us: Option<u64>,
@@ -1442,7 +1525,11 @@ impl From<&Transaction> for TransactionSummary {
                 transaction_hash: txn.hash,
                 pending: Some(true),
                 sender: Some(*txn.request.sender.inner()),
-                sequence_number: Some(txn.request.sequence_number.0),
+                sequence_number: match txn.request.replay_protector() {
+                    ReplayProtector::SequenceNumber(sequence_number) => Some(sequence_number),
+                    _ => None,
+                },
+                replay_protector: Some(txn.request.replay_protector()),
                 gas_used: None,
                 gas_unit_price: None,
                 success: None,
@@ -1458,7 +1545,11 @@ impl From<&Transaction> for TransactionSummary {
                 success: Some(txn.info.success),
                 version: Some(txn.info.version.0),
                 vm_status: Some(txn.info.vm_status.clone()),
-                sequence_number: Some(txn.request.sequence_number.0),
+                sequence_number: match txn.request.replay_protector() {
+                    ReplayProtector::SequenceNumber(sequence_number) => Some(sequence_number),
+                    _ => None,
+                },
+                replay_protector: Some(txn.request.replay_protector()),
                 timestamp_us: Some(txn.timestamp.0),
                 pending: None,
             },
@@ -1472,6 +1563,7 @@ impl From<&Transaction> for TransactionSummary {
                 gas_unit_price: None,
                 pending: None,
                 sequence_number: None,
+                replay_protector: None,
                 timestamp_us: None,
             },
             Transaction::BlockMetadataTransaction(txn) => TransactionSummary {
@@ -1485,6 +1577,7 @@ impl From<&Transaction> for TransactionSummary {
                 gas_unit_price: None,
                 pending: None,
                 sequence_number: None,
+                replay_protector: None,
             },
             Transaction::StateCheckpointTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.info.hash,
@@ -1497,6 +1590,7 @@ impl From<&Transaction> for TransactionSummary {
                 gas_unit_price: None,
                 pending: None,
                 sequence_number: None,
+                replay_protector: None,
             },
             Transaction::BlockEpilogueTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.info.hash,
@@ -1509,6 +1603,7 @@ impl From<&Transaction> for TransactionSummary {
                 gas_unit_price: None,
                 pending: None,
                 sequence_number: None,
+                replay_protector: None,
             },
             Transaction::ValidatorTransaction(txn) => TransactionSummary {
                 transaction_hash: txn.transaction_info().hash,
@@ -1517,6 +1612,7 @@ impl From<&Transaction> for TransactionSummary {
                 pending: None,
                 sender: None,
                 sequence_number: None,
+                replay_protector: None,
                 success: Some(txn.transaction_info().success),
                 timestamp_us: Some(txn.timestamp().0),
                 version: Some(txn.transaction_info().version.0),
@@ -1705,11 +1801,23 @@ pub struct TransactionOptions {
     /// flamegraphs that reflect the gas usage.
     #[clap(long)]
     pub(crate) profile_gas: bool,
+
+    /// If this option is set, simulate the transaction using a local session.
+    #[clap(long)]
+    pub(crate) session: Option<PathBuf>,
+
+    /// Replay protection mechanism to use when generating the transaction.
+    ///
+    /// When "nonce" is chosen, the transaction will be an orderless transaction and contains a replay protection nonce.
+    ///
+    /// When "seqnum" is chosen, the transaction will contain a sequence number that matches with the sender's onchain sequence number.
+    #[clap(long, default_value_t = ReplayProtectionType::Seqnum)]
+    pub(crate) replay_protection_type: ReplayProtectionType,
 }
 
 impl TransactionOptions {
     /// Builds a rest client
-    fn rest_client(&self) -> CliTypedResult<Client> {
+    pub fn rest_client(&self) -> CliTypedResult<Client> {
         self.rest_options.client(&self.profile_options)
     }
 
@@ -1746,11 +1854,12 @@ impl TransactionOptions {
     }
 
     pub fn get_public_key_and_address(&self) -> CliTypedResult<(Ed25519PublicKey, AccountAddress)> {
-        self.private_key_options.extract_public_key_and_address(
-            self.encoding_options.encoding,
-            &self.profile_options,
-            self.sender_account,
-        )
+        self.private_key_options
+            .extract_ed25519_public_key_and_address(
+                self.encoding_options.encoding,
+                &self.profile_options,
+                self.sender_account,
+            )
     }
 
     pub fn sender_address(&self) -> CliTypedResult<AccountAddress> {
@@ -1778,11 +1887,26 @@ impl TransactionOptions {
     }
 
     pub async fn view(&self, payload: ViewFunction) -> CliTypedResult<Vec<serde_json::Value>> {
-        let client = self.rest_client()?;
-        Ok(client
-            .view_bcs_with_json_response(&payload, None)
-            .await?
-            .into_inner())
+        match &self.session {
+            None => {
+                let client = self.rest_client()?;
+                Ok(client
+                    .view_bcs_with_json_response(&payload, None)
+                    .await?
+                    .into_inner())
+            },
+
+            Some(session_path) => {
+                let mut sess = Session::load(session_path)?;
+                let output = sess.execute_view_function(
+                    payload.module,
+                    payload.function,
+                    payload.ty_args,
+                    payload.args,
+                )?;
+                Ok(output)
+            },
+        }
     }
 
     /// Submit a transaction
@@ -1824,7 +1948,7 @@ impl TransactionOptions {
         }
         let expiration_time_secs = now + self.gas_options.expiration_secs;
 
-        let chain_id = ChainId::new(state.chain_id as u64);
+        let chain_id = ChainId::new(state.chain_id);
         // TODO: Check auth key against current private key and provide a better message
 
         let max_gas = if let Some(max_gas) = self.gas_options.max_gas {
@@ -1838,12 +1962,21 @@ impl TransactionOptions {
             let transaction_factory =
                 TransactionFactory::new(chain_id).with_gas_unit_price(gas_unit_price);
 
-            let unsigned_transaction = transaction_factory
+            let txn_builder = transaction_factory
                 .payload(payload.clone())
                 .sender(sender_address)
                 .sequence_number(sequence_number)
-                .expiration_timestamp_secs(expiration_time_secs)
-                .build();
+                .expiration_timestamp_secs(expiration_time_secs);
+
+            let unsigned_transaction = if self.replay_protection_type == ReplayProtectionType::Nonce
+            {
+                let mut rng = rand::thread_rng();
+                txn_builder
+                    .upgrade_payload_with_rng(&mut rng, true, true)
+                    .build()
+            } else {
+                txn_builder.build()
+            };
 
             let signed_transaction = SignedTransaction::new(
                 unsigned_transaction,
@@ -1866,8 +1999,10 @@ impl TransactionOptions {
 
             // Take the gas used and use a headroom factor on it
             let gas_used = simulated_txn.info.gas_used.0;
+            // TODO: remove the hardcoded 530 as it's the minumum gas units required for the transaction that will
+            // automatically create an account for stateless account.
             let adjusted_max_gas =
-                adjust_gas_headroom(gas_used, simulated_txn.request.max_gas_amount.0);
+                adjust_gas_headroom(gas_used, max(simulated_txn.request.max_gas_amount.0, 530));
 
             // Ask if you want to accept the estimate amount
             let upper_cost_bound = adjusted_max_gas * gas_unit_price;
@@ -1893,7 +2028,12 @@ impl TransactionOptions {
                 let (private_key, _) = self.get_key_and_address()?;
                 let sender_account =
                     &mut LocalAccount::new(sender_address, private_key, sequence_number);
-                sender_account.sign_with_transaction_builder(transaction_factory.payload(payload))
+                let mut txn_builder = transaction_factory.payload(payload);
+                if self.replay_protection_type == ReplayProtectionType::Nonce {
+                    let mut rng = rand::thread_rng();
+                    txn_builder = txn_builder.upgrade_payload_with_rng(&mut rng, true, true);
+                };
+                sender_account.sign_with_transaction_builder(txn_builder)
             },
             Ok(AccountType::HardwareWallet) => {
                 let sender_account = &mut HardwareWalletAccount::new(
@@ -1906,8 +2046,12 @@ impl TransactionOptions {
                     HardwareWalletType::Ledger,
                     sequence_number,
                 );
-                sender_account
-                    .sign_with_transaction_builder(transaction_factory.payload(payload))?
+                let mut txn_builder = transaction_factory.payload(payload);
+                if self.replay_protection_type == ReplayProtectionType::Nonce {
+                    let mut rng = rand::thread_rng();
+                    txn_builder = txn_builder.upgrade_payload_with_rng(&mut rng, true, true);
+                };
+                sender_account.sign_with_transaction_builder(txn_builder)?
             },
             Err(err) => return Err(err),
         };
@@ -1975,13 +2119,14 @@ impl TransactionOptions {
         const DEFAULT_MAX_GAS: u64 = 2_000_000;
 
         let (sender_key, sender_address) = self.get_key_and_address()?;
+        // TODO: Consider fetching the min gas unit price from the chain
         let gas_unit_price = self
             .gas_options
             .gas_unit_price
             .unwrap_or(DEFAULT_GAS_UNIT_PRICE);
         let (account, state) = get_account_with_state(&client, sender_address).await?;
         let version = state.version;
-        let chain_id = ChainId::new(state.chain_id as u64);
+        let chain_id = ChainId::new(state.chain_id);
         let sequence_number = account.sequence_number;
 
         let balance = client
@@ -2021,10 +2166,81 @@ impl TransactionOptions {
             gas_unit_price: Some(gas_unit_price),
             pending: None,
             sender: Some(sender_address),
-            sequence_number: None, // The transaction is not comitted so there is no new sequence number.
+            sequence_number: None,
+            replay_protector: None, // The transaction is not comitted so there is no new sequence number.
             success,
             timestamp_us: None,
             version: Some(version), // The transaction is not comitted so there is no new version.
+            vm_status: Some(vm_status.to_string()),
+        };
+
+        Ok(summary)
+    }
+
+    pub async fn simulate_using_session(
+        &self,
+        session_path: &Path,
+        payload: TransactionPayload,
+    ) -> CliTypedResult<TransactionSummary> {
+        let mut sess = Session::load(session_path)?;
+
+        let state_store = sess.state_store();
+
+        // Fetch the chain states required for the simulation
+        const DEFAULT_GAS_UNIT_PRICE: u64 = 100;
+        const DEFAULT_MAX_GAS: u64 = 2_000_000;
+
+        let (sender_key, sender_address) = self.get_key_and_address()?;
+
+        // TODO: Support orderless transactions
+        let account = state_store.get_resource::<AccountResource>(sender_address)?;
+        let seq_num = match account {
+            Some(account) => account.sequence_number,
+            None => 0,
+        };
+
+        // TODO: Consider fetching the min gas unit price from the chain
+        let gas_unit_price = self
+            .gas_options
+            .gas_unit_price
+            .unwrap_or(DEFAULT_GAS_UNIT_PRICE);
+
+        let balance = state_store.get_apt_balance(sender_address)?;
+        let max_gas = self.gas_options.max_gas.unwrap_or_else(|| {
+            if gas_unit_price == 0 {
+                DEFAULT_MAX_GAS
+            } else {
+                std::cmp::min(balance / gas_unit_price, DEFAULT_MAX_GAS)
+            }
+        });
+
+        let transaction_factory = TransactionFactory::new(state_store.get_chain_id()?)
+            .with_gas_unit_price(gas_unit_price)
+            .with_max_gas_amount(max_gas)
+            .with_transaction_expiration_time(self.gas_options.expiration_secs);
+        let sender_account = &mut LocalAccount::new(sender_address, sender_key, seq_num);
+        let transaction =
+            sender_account.sign_with_transaction_builder(transaction_factory.payload(payload));
+        let hash = transaction.committed_hash();
+
+        let (vm_status, txn_output) = sess.execute_transaction(transaction)?;
+
+        let success = match txn_output.status() {
+            TransactionStatus::Keep(exec_status) => Some(exec_status.is_success()),
+            TransactionStatus::Discard(_) | TransactionStatus::Retry => None,
+        };
+
+        let summary = TransactionSummary {
+            transaction_hash: hash.into(),
+            gas_used: Some(txn_output.gas_used()),
+            gas_unit_price: Some(gas_unit_price),
+            pending: None,
+            sender: Some(sender_address),
+            sequence_number: Some(seq_num),
+            replay_protector: None,
+            success,
+            timestamp_us: None,
+            version: None,
             vm_status: Some(vm_status.to_string()),
         };
 
@@ -2417,6 +2633,37 @@ pub struct OverrideSizeCheckOption {
 }
 
 #[derive(Parser)]
+pub struct LargePackagesModuleOption {
+    /// Address of the `large_packages` move module for chunked publishing
+    ///
+    /// By default, on the module is published at `0x0e1ca3011bdd07246d4d16d909dbb2d6953a86c4735d5acf5865d962c630cce7`
+    /// on Testnet and Mainnet, and `0x7` on localnest/devnet.
+    /// On any custom network where neither is used, you will need to first publish it from the framework
+    /// under move-examples/large_packages.
+    #[clap(long, value_parser = crate::common::types::load_account_arg)]
+    pub(crate) large_packages_module_address: Option<AccountAddress>,
+}
+
+impl LargePackagesModuleOption {
+    pub(crate) async fn large_packages_module_address(
+        &self,
+        client: &Client,
+    ) -> Result<AccountAddress, CliError> {
+        if let Some(address) = self.large_packages_module_address {
+            Ok(address)
+        } else {
+            let chain_id = ChainId::new(client.get_ledger_information().await?.inner().chain_id);
+            Ok(
+                AccountAddress::from_str_strict(default_large_packages_module_address(&chain_id))
+                    .map_err(|err| {
+                    CliError::UnableToParse("Default Large Package Module Address", err.to_string())
+                })?,
+            )
+        }
+    }
+}
+
+#[derive(Parser)]
 pub struct ChunkedPublishOption {
     /// Whether to publish a package in a chunked mode. This may require more than one transaction
     /// for publishing the Move package.
@@ -2425,13 +2672,8 @@ pub struct ChunkedPublishOption {
     #[clap(long)]
     pub(crate) chunked_publish: bool,
 
-    /// Address of the `large_packages` move module for chunked publishing
-    ///
-    /// By default, on the module is published at `0x0e1ca3011bdd07246d4d16d909dbb2d6953a86c4735d5acf5865d962c630cce7`
-    /// on Testnet and Mainnet. On any other network, you will need to first publish it from the framework
-    /// under move-examples/large_packages.
-    #[clap(long, default_value = LARGE_PACKAGES_MODULE_ADDRESS, value_parser = crate::common::types::load_account_arg)]
-    pub(crate) large_packages_module_address: AccountAddress,
+    #[clap(flatten)]
+    pub(crate) large_packages_module: LargePackagesModuleOption,
 
     /// Size of the code chunk in bytes for splitting bytecode and metadata of large packages
     ///
